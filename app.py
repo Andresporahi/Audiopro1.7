@@ -10,7 +10,7 @@ import subprocess
 import shutil
 from datetime import datetime
 from typing import Optional
-from app import (
+from audio_utils import (
     get_bytes_from_local_path,
     get_bytes_from_drive,
     extract_audio_wav16_mono,
@@ -30,7 +30,7 @@ PIPELINE_VERSION = "v1.7.0"
 # Rutas de Reaper
 REAPER_EXE = r"C:\Program Files\REAPER (x64)\reaper.exe"
 REAPER_TEMPLATE = r"F:\00\00 Reaper\00 Voces.rpp"
-REAPER_SESSIONS_DIR = r"F:\CURSOS\2025\Q3"
+REAPER_SESSIONS_DIR = r"F:\00\00 Reaper\Procesados"
 
 # Límite de archivos
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "800"))
@@ -90,59 +90,120 @@ def create_reaper_session_from_template(
     return new_session_path
 
 
-def add_audio_to_reaper_session(session_path: str, audio_file: str):
-    """Agrega un archivo de audio a una sesión de Reaper.
+def test_reaper_script():
+    """Función de prueba para verificar que Reaper funciona correctamente."""
+    lua_script = os.path.join(os.path.dirname(__file__), "test_reaper.lua")
+    
+    if not os.path.exists(lua_script):
+        st.error("❌ Script de prueba no encontrado")
+        return
+
+    # Ejecutar script de prueba
+    cmd = [
+        REAPER_EXE,
+        '-nosplash',
+        lua_script,
+        "test_audio.wav",
+        "F:\\00\\00 Reaper\\test_session.rpp"
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        st.info(f"Resultado: {result.returncode}")
+        st.info(f"Salida: {result.stdout}")
+        if result.stderr:
+            st.error(f"Error: {result.stderr}")
+    except Exception as e:
+        st.error(f"❌ Error ejecutando prueba: {e}")
+
+
+def add_audio_to_reaper_session(session_path: str, audio_file: str, original_name: str = None):
+    """Agrega un archivo de audio a una sesión de Reaper usando ReaScript Lua.
 
     Args:
         session_path: Ruta al archivo .rpp de la sesión
         audio_file: Ruta al archivo de audio a agregar
+        original_name: Nombre original del archivo (sin extensión)
     """
-    # Leer sesión actual
-    with open(session_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
+    # Usar el script Lua estático
+    lua_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "add_audio_to_session.lua"))
+    if not os.path.exists(lua_script):
+        st.error("❌ Script Lua no encontrado: add_audio_to_session.lua")
+        return
 
-    # Encontrar la sección de TRACK y agregar el item
-    track_found = False
-    insert_index = 0
+    # Crear script temporal que establece ExtState y ejecuta el script principal
+    # Según documentación: usar SetExtState para pasar parámetros
+    temp_script = tempfile.NamedTemporaryFile(
+        mode='w',
+        suffix='.lua',
+        delete=False,
+        encoding='utf-8'
+    )
 
-    for i, line in enumerate(lines):
-        if '<TRACK' in line:
-            track_found = True
-        if track_found and '>' in line and '<' not in line:
-            insert_index = i + 1
-            break
+    # Convertir rutas a formato compatible con Lua (usar / en lugar de \)
+    lua_script_path = lua_script.replace('\\', '/')
+    audio_file_path = audio_file.replace('\\', '/')
+    session_path_path = session_path.replace('\\', '/')
+    template_path = REAPER_TEMPLATE.replace('\\', '/')
+    
+    # Usar el nombre original proporcionado o fallback al nombre del audio_file
+    if not original_name:
+        original_name = os.path.splitext(os.path.basename(audio_file))[0]
 
-    # Crear item de audio
-    audio_item = f'''    <ITEM
-      POSITION 0
-      SNAPOFFS 0
-      LENGTH {get_audio_duration(audio_file)}
-      LOOP 0
-      ALLTAKES 0
-      FADEIN 1 0 0 1 0 0 0
-      FADEOUT 1 0 0 1 0 0 0
-      MUTE 0 0
-      SEL 0
-      IGUID {{GENERATED_GUID}}
-      IID 1
-      NAME "{os.path.basename(audio_file)}"
-      VOLPAN 1 0 1 -1
-      SOFFS 0
-      PLAYRATE 1 1 0 -1 0 0.0025
-      CHANMODE 0
-      GUID {{GENERATED_GUID2}}
-      <SOURCE WAVE
-        FILE "{audio_file}"
-      >
-    >
-'''
+    temp_script.write(f"""
+-- Script temporal para pasar parámetros usando ExtState
+-- Según documentación de ReaScript: https://www.reaper.fm/sdk/reascript/reascript.php
 
-    # Insertar item
-    lines.insert(insert_index, audio_item)
+-- Establecer parámetros usando ExtState
+reaper.SetExtState("AudioPro", "audio_file", [[{audio_file_path}]], false)
+reaper.SetExtState("AudioPro", "session_name", [[{session_path_path}]], false)
+reaper.SetExtState("AudioPro", "template_path", [[{template_path}]], false)
+reaper.SetExtState("AudioPro", "original_name", [[{original_name}]], false)
 
-    # Guardar sesión actualizada
-    with open(session_path, 'w', encoding='utf-8') as f:
-        f.writelines(lines)
+-- Ejecutar el script principal
+dofile([[{lua_script_path}]])
+
+-- Limpiar ExtState
+reaper.DeleteExtState("AudioPro", "audio_file", false)
+reaper.DeleteExtState("AudioPro", "session_name", false)
+reaper.DeleteExtState("AudioPro", "template_path", false)
+reaper.DeleteExtState("AudioPro", "original_name", false)
+""")
+    temp_script.close()
+
+    # Ejecutar ReaScript según documentación
+    cmd = [
+        REAPER_EXE,
+        '-nosplash',
+        temp_script.name
+    ]
+
+    try:
+        # Ejecutar Reaper en background para que permanezca abierto
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Esperar un poco para que Reaper inicie y ejecute el script
+        import time
+        time.sleep(5)  # Esperar 5 segundos para que el script se ejecute
+        
+        # Verificar si el proceso sigue corriendo
+        if process.poll() is None:
+            st.success("✅ Audio agregado a sesión de Reaper - Reaper permanecerá abierto")
+        else:
+            # Si terminó, verificar el código de salida
+            stdout, stderr = process.communicate()
+            if process.returncode != 0:
+                st.error(f"❌ Error ejecutando ReaScript: {stderr}")
+            else:
+                st.success("✅ Audio agregado a sesión de Reaper")
+    except Exception as e:
+        st.error(f"❌ Error ejecutando ReaScript: {e}")
+    finally:
+        # Limpiar archivo temporal
+        try:
+            os.unlink(temp_script.name)
+        except Exception:
+            pass
 
 
 def get_audio_duration(audio_file: str) -> float:
@@ -166,61 +227,42 @@ def get_audio_duration(audio_file: str) -> float:
         return 10.0  # Default 10 segundos
 
 
-def render_reaper_session(session_path: str, reaper_exe: str) -> str:
-    """Renderiza una sesión de Reaper y retorna la ruta del archivo renderizado.
+def render_reaper_session(session_path: str, reaper_exe: str, original_name: str = None) -> str:
+    """El render ya se hace en add_audio_to_reaper_session, solo retorna la ruta esperada.
 
     Args:
         session_path: Ruta al archivo .rpp de la sesión
         reaper_exe: Ruta al ejecutable de Reaper
+        original_name: Nombre original del archivo (sin extensión)
 
     Returns:
         Ruta al archivo renderizado
     """
-    # Comando para renderizar
-    cmd = [
-        reaper_exe,
-        '-renderproject', session_path,
-        '-nosplash',
-        '-close'
-    ]
-
-    st.info(f"🎛️ Renderizando en Reaper: {os.path.basename(session_path)}")
-
-    # Ejecutar Reaper
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE
-    )
-
-    # Esperar con timeout
-    try:
-        process.wait(timeout=300)  # 5 minutos max
-    except subprocess.TimeoutExpired:
-        process.kill()
-        raise Exception("Reaper excedió el tiempo límite de render (5 min)")
-
-    # Buscar archivo renderizado
+    # El render ya se ejecutó en add_audio_to_reaper_session
+    # Solo retornamos la ruta esperada del archivo renderizado
     session_dir = os.path.dirname(session_path)
-    session_name = os.path.splitext(os.path.basename(session_path))[0]
-
-    # Buscar archivo con patrón
-    possible_files = [
-        os.path.join(session_dir, f"{session_name}.wav"),
-        os.path.join(session_dir, f"{session_name}-master.wav"),
-        os.path.join(session_dir, f"{session_name} master.wav"),
-    ]
-
-    for file_path in possible_files:
-        if os.path.exists(file_path):
-            return file_path
-
-    # Si no se encuentra, buscar en el directorio
-    for file in os.listdir(session_dir):
-        if file.endswith('.wav') and session_name in file:
-            return os.path.join(session_dir, file)
-
-    raise Exception(f"No se encontró archivo renderizado en {session_dir}")
+    
+    if original_name:
+        # Usar nombre original del archivo
+        output_file = os.path.join(session_dir, f"{original_name}_renderizado.wav")
+    else:
+        # Fallback al nombre de sesión
+        session_name = os.path.splitext(os.path.basename(session_path))[0]
+        output_file = os.path.join(session_dir, f"{session_name}_renderizado.wav")
+    
+    st.info(f"🔍 Buscando archivo renderizado en: {output_file}")
+    
+    # Verificar que el archivo existe
+    if os.path.exists(output_file):
+        st.success(f"✅ Render completado: {output_file}")
+        return output_file
+    else:
+        st.error(f"❌ Archivo renderizado no encontrado en: {output_file}")
+        # Listar archivos en el directorio para debug
+        if os.path.exists(session_dir):
+            files = os.listdir(session_dir)
+            st.info(f"📂 Archivos en {session_dir}: {files}")
+        return None
 
 
 def process_with_reaper_pipeline(
@@ -258,35 +300,74 @@ def process_with_reaper_pipeline(
     # 3) ElevenLabs Audio Isolation
     if ELEVENLABS_API_KEY and ELEVENLABS_BASE_URL:
         st.info("🤖 Aplicando Audio Isolation (ElevenLabs)...")
+        st.info(f"📤 Enviando a ElevenLabs: {audio_wav}")
+        audio_wav_before = audio_wav
         audio_wav = process_audio_with_elevenlabs(audio_wav)
+        if audio_wav != audio_wav_before:
+            st.success(f"✅ ElevenLabs procesó correctamente: {audio_wav}")
+        else:
+            st.warning("⚠️ ElevenLabs no procesó el audio - usando original")
     else:
         st.warning("⚠️ ElevenLabs no configurado - saltando Audio Isolation")
 
-    # 4) Crear sesión de Reaper
+    # 4) Crear directorio de sesiones si no existe
+    os.makedirs(REAPER_SESSIONS_DIR, exist_ok=True)
+    
+    # 5) Definir ruta de la nueva sesión
+    session_path = os.path.join(REAPER_SESSIONS_DIR, f"{session_name}.rpp")
+    
     st.info(f"🎛️ Creando sesión de Reaper: {session_name}")
-    session_path = create_reaper_session_from_template(
-        REAPER_TEMPLATE,
-        session_name,
-        audio_wav,
-        REAPER_SESSIONS_DIR
-    )
-
-    # 5) Agregar audio a la sesión
+    st.info(f"📁 Sesión se guardará en: {session_path}")
+    
+    # 6) Agregar audio a la sesión (esto crea la sesión desde el template)
     st.info("📂 Agregando audio a sesión de Reaper...")
-    add_audio_to_reaper_session(session_path, audio_wav)
+    st.info(f"📤 Enviando a Reaper: {audio_wav}")
+    
+    # Obtener nombre original sin extensión para pasar a Reaper
+    original_name_clean = os.path.splitext(original_name)[0]
+    add_audio_to_reaper_session(session_path, audio_wav, original_name_clean)
 
-    # 6) Renderizar en Reaper
-    st.info("⚙️ Renderizando en Reaper (esto puede tomar unos minutos)...")
-    rendered_audio = render_reaper_session(session_path, REAPER_EXE)
+    # 7) Esperar a que Reaper termine el render
+    st.info("⚙️ Esperando a que Reaper complete el render...")
+    st.warning("⏰ Por favor, ten paciencia. El procesamiento con Reaper puede tomar varios minutos.")
+    
+    # Esperar hasta 10 minutos para que el archivo renderizado aparezca
+    session_dir = os.path.dirname(session_path)
+    expected_render = os.path.join(session_dir, f"{original_name_clean}_renderizado.wav")
+    
+    import time
+    max_wait = 600  # 10 minutos
+    elapsed = 0
+    check_interval = 5  # Verificar cada 5 segundos
+    
+    while elapsed < max_wait:
+        if os.path.exists(expected_render):
+            # Esperar un poco más para asegurar que el archivo esté completamente escrito
+            time.sleep(2)
+            st.success(f"✅ Render completado: {expected_render}")
+            rendered_audio = expected_render
+            break
+        time.sleep(check_interval)
+        elapsed += check_interval
+        if elapsed % 30 == 0:  # Mostrar progreso cada 30 segundos
+            st.info(f"⏳ Esperando render... ({elapsed}s / {max_wait}s)")
+    else:
+        st.error(f"❌ Timeout esperando el archivo renderizado: {expected_render}")
+        raise Exception("Timeout esperando render de Reaper")
 
-    # 7) Determinar directorio de salida
+    # Verificar que el render fue exitoso
+    if not rendered_audio or not os.path.exists(rendered_audio):
+        st.error("❌ El render de Reaper no generó un archivo de salida")
+        raise Exception("Render de Reaper falló")
+
+    # 8) Determinar directorio de salida
     if source_dir:
         output_dir = os.path.join(source_dir, 'procesados')
         os.makedirs(output_dir, exist_ok=True)
     else:
         output_dir = os.path.dirname(rendered_audio)
 
-    # 8) Procesar según tipo de archivo
+    # 9) Procesar según tipo de archivo
     is_video = not is_audio_only_file(tmp_input)
 
     if is_video:
@@ -322,7 +403,8 @@ def process_with_reaper_pipeline(
         'original_name': original_name,
         'output_file': final_out,
         'reaper_session': session_path,
-        'is_video': is_video
+        'is_video': is_video,
+        'is_local': source_dir is not None  # Indica si es archivo local
     }
 
 
@@ -364,6 +446,24 @@ def main():
 
         **Reaper**: `{REAPER_EXE}`
         """)
+
+        st.markdown("---")
+        st.header("🤖 ElevenLabs")
+
+        # Botón para deshabilitar ElevenLabs
+        if st.button("🔧 Deshabilitar ElevenLabs temporalmente"):
+            st.session_state['disable_elevenlabs'] = True
+            st.success("✅ ElevenLabs deshabilitado - Se saltará Voice Isolator")
+
+        if st.button("🔄 Rehabilitar ElevenLabs"):
+            st.session_state['disable_elevenlabs'] = False
+            st.success("✅ ElevenLabs habilitado - Se aplicará Voice Isolator")
+            
+        st.divider()
+        
+        # Botón de prueba para Reaper
+        if st.button("🧪 Probar Reaper"):
+            test_reaper_script()
 
         st.markdown("---")
         st.header("👥 Usuarios Activos")
@@ -472,14 +572,33 @@ def main():
             st.header("✅ Resultados")
             for result in results:
                 st.subheader(f"📁 {result['original_name']}")
-                st.success(f"✅ Archivo procesado: `{result['output_file']}`")
-                st.info(f"🎛️ Sesión de Reaper: `{result['reaper_session']}`")
-
-                # Preview si es posible
-                if result['is_video']:
-                    st.video(result['output_file'])
+                
+                if result.get('is_local', False):
+                    # Archivo local - solo mostrar ruta
+                    st.success(f"✅ Archivo procesado guardado en:")
+                    st.code(result['output_file'], language=None)
+                    st.info(f"🎛️ Sesión de Reaper guardada en:")
+                    st.code(result['reaper_session'], language=None)
+                    st.info("💡 Los archivos están listos en tu sistema local")
                 else:
-                    st.audio(result['output_file'])
+                    # Archivo subido - mostrar preview y descarga
+                    st.success(f"✅ Archivo procesado: `{result['output_file']}`")
+                    st.info(f"🎛️ Sesión de Reaper: `{result['reaper_session']}`")
+                    
+                    # Preview
+                    if result['is_video']:
+                        st.video(result['output_file'])
+                    else:
+                        st.audio(result['output_file'])
+                    
+                    # Botón de descarga
+                    with open(result['output_file'], 'rb') as f:
+                        st.download_button(
+                            label=f"📥 Descargar {os.path.basename(result['output_file'])}",
+                            data=f.read(),
+                            file_name=os.path.basename(result['output_file']),
+                            mime='video/mp4' if result['is_video'] else 'audio/wav'
+                        )
 
 
 if __name__ == '__main__':
